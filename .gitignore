@@ -1,0 +1,13 @@
+# UV Virtual environment folder
+.venv/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code settings
+.vscode/
+
+# Jupyter Notebook Cache
+.ipynb_checkpoints/
