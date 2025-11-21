@@ -501,3 +501,401 @@ else:
     # Torch not available - placeholders
     def make_windows(*args, **kwargs):
         raise ImportError("Torch is required for sequence models")
+
+
+# ============================================================
+#  PART 3 — ANOMALY MODELS (IsolationForest + Simple Autoencoder)
+# ============================================================
+
+# Note: sklearn's IsolationForest is already imported at top.
+# Torch is optional; if torch not available we fallback to IF only.
+
+# ---------------------------
+# IsolationForest wrapper
+# ---------------------------
+def fit_isolation_forest(X_train: np.ndarray, contamination: float = 0.01, random_state: int = 42):
+    """
+    Fit sklearn IsolationForest on numeric features.
+    Returns fitted model.
+    """
+    model = IsolationForest(contamination=contamination, random_state=random_state, n_jobs=-1)
+    model.fit(X_train)
+    return model
+
+
+def if_anomaly_score(model, X: np.ndarray):
+    """
+    Return anomaly score per sample (higher = more anomalous).
+    sklearn's decision_function: larger -> more normal, so we invert sign.
+    We'll return positive anomaly score where larger => more anomalous.
+    """
+    # decision_function: the higher, the more normal. We invert and normalize.
+    raw = model.decision_function(X)
+    score = -raw  # now higher means more anomalous
+    # normalize to 0..1
+    minv, maxv = float(np.nanmin(score)), float(np.nanmax(score))
+    if maxv - minv < 1e-12:
+        return np.zeros_like(score)
+    return (score - minv) / (maxv - minv)
+
+
+# ---------------------------
+# Simple Autoencoder (MLP) for anomaly scoring
+# ---------------------------
+if torch is not None:
+    class SimpleAutoencoder(nn.Module):
+        """
+        Lightweight MLP autoencoder for tabular sensor data.
+        encoder: F -> hidden -> bottleneck
+        decoder: bottleneck -> hidden -> F
+        """
+        def __init__(self, n_features: int, hidden_dim: int = 64, bottleneck: int = 16, dropout: float = 0.1):
+            super().__init__()
+            self.enc1 = nn.Linear(n_features, hidden_dim)
+            self.enc2 = nn.Linear(hidden_dim, bottleneck)
+            self.dec1 = nn.Linear(bottleneck, hidden_dim)
+            self.dec2 = nn.Linear(hidden_dim, n_features)
+            self.drop = nn.Dropout(dropout)
+            self.act = nn.ReLU()
+
+        def forward(self, x):
+            # x: (B, F)
+            h = self.act(self.enc1(x))
+            h = self.drop(h)
+            z = self.act(self.enc2(h))
+            h2 = self.act(self.dec1(z))
+            out = self.dec2(h2)
+            return out
+
+    def train_autoencoder(
+        model: nn.Module,
+        X_train: np.ndarray,
+        X_val: Optional[np.ndarray] = None,
+        lr: float = 1e-3,
+        batch_size: int = 128,
+        epochs: int = 50,
+        device: str = "cpu",
+        patience: int = 6
+    ):
+        """
+        Train the autoencoder on X_train (numpy). Returns trained model and final val_loss.
+        """
+        model.to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-6)
+        best_val = float("inf")
+        best_state = None
+        no_improve = 0
+
+        # prepare dataloaders
+        Xtr_t = torch.tensor(X_train, dtype=torch.float32)
+        train_ds = torch.utils.data.TensorDataset(Xtr_t)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+
+        if X_val is not None:
+            Xv_t = torch.tensor(X_val, dtype=torch.float32)
+            val_ds = torch.utils.data.TensorDataset(Xv_t)
+            val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        else:
+            val_loader = None
+
+        for ep in range(epochs):
+            model.train()
+            train_losses = []
+            for (xb,) in train_loader:
+                xb = xb.to(device)
+                recon = model(xb)
+                loss = F.mse_loss(recon, xb)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                train_losses.append(loss.item())
+            # val
+            val_loss = None
+            if val_loader is not None:
+                model.eval()
+                val_losses = []
+                with torch.no_grad():
+                    for (xb,) in val_loader:
+                        xb = xb.to(device)
+                        recon = model(xb)
+                        val_losses.append(F.mse_loss(recon, xb).item())
+                val_loss = float(np.mean(val_losses))
+            else:
+                val_loss = float(np.mean(train_losses))
+
+            logger.info(f"[AE] Epoch {ep:02d} train_mse {np.mean(train_losses):.6f} val_mse {val_loss:.6f}")
+
+            if val_loss < best_val:
+                best_val = val_loss
+                best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        return model, best_val
+
+
+    def ae_reconstruction_error(model: nn.Module, X: np.ndarray, device: str = "cpu"):
+        """
+        Compute MSE reconstruction error per row (numpy).
+        """
+        model.to(device)
+        model.eval()
+        X_t = torch.tensor(X, dtype=torch.float32).to(device)
+        with torch.no_grad():
+            recon = model(X_t).cpu().numpy()
+        err = np.mean((recon - X)**2, axis=1)
+        # normalize 0..1
+        minv, maxv = float(np.nanmin(err)), float(np.nanmax(err))
+        if maxv - minv < 1e-12:
+            return np.zeros_like(err)
+        return (err - minv) / (maxv - minv)
+
+
+    def ae_threshold_by_percentile(errors: np.ndarray, pct: float = 95.0):
+        """
+        Choose threshold for anomaly decision based on percentile of errors.
+        Returns threshold value.
+        """
+        return float(np.percentile(errors, pct))
+
+else:
+    # Torch not available placeholders
+    def train_autoencoder(*args, **kwargs):
+        raise ImportError("PyTorch not installed; autoencoder unavailable.")
+
+    def ae_reconstruction_error(*args, **kwargs):
+        raise ImportError("PyTorch not installed; autoencoder unavailable.")
+
+    def ae_threshold_by_percentile(*args, **kwargs):
+        raise ImportError("PyTorch not installed; autoencoder unavailable.")
+
+
+# ============================================================
+#  PART 4 — OPTUNA TUNING + SAVE/LOAD + UNIFIED MODEL API
+# ============================================================
+
+# ------------------------------------------------------------
+#  (A) Optuna: RF / ElasticNet / LGBM / LSTM
+# ------------------------------------------------------------
+
+def optuna_objective_rf(trial, X, y, df, n_splits=3):
+    """
+    Time-aware Optuna tuning for RandomForest
+    """
+    params = {
+        "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+        "max_depth": trial.suggest_int("max_depth", 4, 20),
+        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 6),
+    }
+    folds = make_time_splits_rel(df, n_splits=n_splits)
+    maes = []
+    for tr, va in folds:
+        model = RandomForestRegressor(**params, random_state=42)
+        model.fit(X[tr], y[tr])
+        preds = model.predict(X[va])
+        maes.append(mean_absolute_error(y[va], preds))
+    return np.mean(maes)
+
+
+def optuna_objective_elasticnet(trial, X, y, df, n_splits=3):
+    params = {
+        "alpha": trial.suggest_float("alpha", 1e-3, 5.0, log=True),
+        "l1_ratio": trial.suggest_float("l1_ratio", 0.0, 1.0),
+    }
+    folds = make_time_splits_rel(df, n_splits=n_splits)
+    maes = []
+    for tr, va in folds:
+        model = ElasticNet(**params, max_iter=20000, random_state=42)
+        model.fit(X[tr], y[tr])
+        preds = model.predict(X[va])
+        maes.append(mean_absolute_error(y[va], preds))
+    return np.mean(maes)
+
+
+def run_optuna_tuning(model_name, X, y, df, n_trials=20, n_splits=3):
+    """
+    Unified Optuna tuning entry for classical models.
+    Supported:
+        - rf
+        - elasticnet
+        - lgbm  (delegated to optuna_objective_lgb)
+    """
+    if optuna is None:
+        raise ImportError("Optuna not installed.")
+
+    study = optuna.create_study(direction="minimize")
+
+    if model_name == "rf":
+        study.optimize(lambda trial: optuna_objective_rf(trial, X, y, df, n_splits),
+                       n_trials=n_trials)
+
+    elif model_name == "elasticnet":
+        study.optimize(lambda trial: optuna_objective_elasticnet(trial, X, y, df, n_splits),
+                       n_trials=n_trials)
+
+    elif model_name == "lgbm":
+        study.optimize(lambda trial: optuna_objective_lgb(trial, X, y, df, n_splits),
+                       n_trials=n_trials)
+
+    else:
+        raise ValueError(f"Unknown model_name: {model_name}")
+
+    logger.info(f"[Optuna] Best params for {model_name}: {study.best_params}")
+    return study.best_params
+
+
+def run_optuna_lstm(train_df, val_df, feature_cols, n_trials=10):
+    """
+    Unified Optuna tuning entry for LSTM.
+    """
+    if torch is None or optuna is None:
+        raise ImportError("PyTorch/Optuna required for LSTM tuning.")
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(
+        lambda trial: optuna_objective_lstm(trial, train_df, val_df, feature_cols),
+        n_trials=n_trials
+    )
+    logger.info(f"[Optuna] Best LSTM params: {study.best_params}")
+    return study.best_params
+
+
+# ------------------------------------------------------------
+#  (B) Save / Load (sklearn, LGBM, PyTorch)
+# ------------------------------------------------------------
+
+def save_lightgbm_model(model, path: str):
+    if lgb is None:
+        raise ImportError("LightGBM not installed.")
+    model.save_model(path)
+    logger.info(f"Saved LightGBM model to {path}")
+
+
+def load_lightgbm_model(path: str):
+    if lgb is None:
+        raise ImportError("LightGBM not installed.")
+    model = lgb.Booster(model_file=path)
+    return model
+
+
+def save_torch_model(model, path: str):
+    if torch is None:
+        raise ImportError("PyTorch not installed.")
+    torch.save(model.state_dict(), path)
+    logger.info(f"Saved PyTorch model to {path}")
+
+
+def load_torch_model(model_class, path: str, *args, **kwargs):
+    if torch is None:
+        raise ImportError("PyTorch not installed.")
+    model = model_class(*args, **kwargs)
+    state = torch.load(path, map_location="cpu")
+    model.load_state_dict(state)
+    return model
+
+
+# ------------------------------------------------------------
+#  (C) Unified API — Model Registry
+# ------------------------------------------------------------
+
+class ModelRegistry:
+    """
+    Provides a clean interface:
+        registry.fit("lgbm", X_train, y_train, ...)
+        registry.predict("lgbm", X_test)
+        registry.save("lgbm", "path")
+        registry.load("lgbm", "path")
+    """
+
+    def __init__(self):
+        self.models = {}
+
+    # -----------------------------------
+    # Fit
+    # -----------------------------------
+    def fit(self, name, **kwargs):
+        if name == "rf":
+            model = fit_random_forest(kwargs["X_train"], kwargs["y_train"], params=kwargs.get("params"))
+        elif name == "elasticnet":
+            model = fit_elasticnet(kwargs["X_train"], kwargs["y_train"], params=kwargs.get("params"))
+        elif name == "lgbm":
+            model, _ = fit_lightgbm(
+                kwargs["X_train"], kwargs["y_train"],
+                kwargs.get("X_val"), kwargs.get("y_val"),
+                params=kwargs.get("params")
+            )
+        elif name == "lstm":
+            if torch is None:
+                raise ImportError("PyTorch required for LSTM")
+            model = kwargs["model"]
+            train_lstm(model,
+                       kwargs["train_loader"], kwargs["val_loader"],
+                       lr=kwargs.get("lr", 1e-3),
+                       epochs=kwargs.get("epochs", 30),
+                       device=kwargs.get("device", "cpu"))
+        elif name == "iforest":
+            model = fit_isolation_forest(kwargs["X_train"], contamination=kwargs.get("contamination", 0.01))
+        else:
+            raise ValueError(f"Unknown model type: {name}")
+
+        self.models[name] = model
+        return model
+
+    # -----------------------------------
+    # Predict
+    # -----------------------------------
+    def predict(self, name, X):
+        model = self.models.get(name)
+        if model is None:
+            raise ValueError(f"Model {name} not trained or loaded.")
+        if name == "lstm":
+            raise NotImplementedError("Use manual LSTM forward pass (sequence).")
+        return model.predict(X)
+
+    # -----------------------------------
+    # Save
+    # -----------------------------------
+    def save(self, name, path):
+        model = self.models.get(name)
+        if model is None:
+            raise ValueError(f"Model {name} not available.")
+
+        if name in ["rf", "elasticnet"]:
+            save_sklearn_model(model, path)
+
+        elif name == "lgbm":
+            save_lightgbm_model(model, path)
+
+        elif name == "lstm":
+            save_torch_model(model, path)
+
+        elif name == "iforest":
+            save_sklearn_model(model, path)
+
+        else:
+            raise ValueError(f"Unknown model type: {name}")
+
+    # -----------------------------------
+    # Load
+    # -----------------------------------
+    def load(self, name, path, model_class=None, *args, **kwargs):
+        if name in ["rf", "elasticnet", "iforest"]:
+            self.models[name] = load_sklearn_model(path)
+
+        elif name == "lgbm":
+            self.models[name] = load_lightgbm_model(path)
+
+        elif name == "lstm":
+            if model_class is None:
+                raise ValueError("Must provide model_class for LSTM load")
+            self.models[name] = load_torch_model(model_class, path, *args, **kwargs)
+
+        else:
+            raise ValueError(f"Unknown model {name}")
+
+        return self.models[name]
